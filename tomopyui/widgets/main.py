@@ -6,6 +6,7 @@ from tomopyui.widgets.dataexplorer import DataExplorerTab
 from tomopyui.widgets.imports import (
     Import_ALS832,
     Import_APS,
+    Import_Nexus,
     Import_SSRL62B,
     Import_SSRL62C,
 )
@@ -46,6 +47,8 @@ def create_dashboard(institution: str):
         file_import = Import_SSRL62B()
     if institution == "APS":
         file_import = Import_APS()
+    if institution == "nexus":
+        file_import = Import_Nexus()
     prep = Prep(file_import)
     center = Center(file_import)
     align = Align(file_import, center)

@@ -65,6 +65,10 @@ class IOBase:
     hdf_key_percentile = "percentile"
     hdf_key_ds_factor = "ds_factor"
     hdf_key_process = "/process"
+    # nexus keys
+    nxs_key_data = "/entry1/tomo_entry/data/data"
+    nxs_key_theta = "/entry1/tomo_entry/data/rotation_angle"
+    nxs_key_image_key = "/entry1/tomo_entry/instrument/detector/image_key"
 
     hdf_keys_ds_hist = [
         hdf_key_bin_frequency,
@@ -1969,6 +1973,131 @@ class RawProjectionsHDF5_APS(RawProjectionsHDF5_ALS832):
         metadata.save_metadata()
         return metadata
 
+class RawProjections_Nexus(RawProjectionsBase):
+
+    def __init__(self):
+        super().__init__()
+        self.allowed_extensions = [".nxs"]
+        self.metadata = Metadata_Nexus_Raw()
+
+    def import_filedir_all(self, filedir):
+        pass
+
+    def import_filedir_projections(self, filedir):
+        pass
+
+    def import_filedir_flats(self, filedir):
+        pass
+
+    def import_filedir_darks(self, filedir):
+        pass
+    
+    def import_nexus(self, nexus_filepath):
+        self._open_hdf_file_read_only(nexus_filepath)
+        image_keys = self.hdf_file[self.nxs_key_image_key]
+        projs = self.hdf_file[self.nxs_key_data][image_keys==0]
+        flats = self.hdf_file[self.nxs_key_data][image_keys==1]
+        darks = self.hdf_file[self.nxs_key_data][image_keys==2]
+        angles_deg = (180 / np.pi) * self.hdf_file[self.nxs_key_theta][image_keys==0]
+        self._close_hdf_file()
+        return projs, flats, darks, angles_deg
+
+    def import_file_all(self, Uploader):
+        self.import_status_label = Uploader.import_status_label
+        self.tic = time.perf_counter()
+        self.filedir = Uploader.filedir
+        self.filename = Uploader.filename
+        self.filepath = self.filedir / self.filename
+        self.metadata = Uploader.reset_metadata_to()
+        self.metadata.load_metadata_h5(self.filepath)
+        self.metadata.set_attributes_from_metadata(self)
+        self.import_status_label.value = "Importing"
+        # scan = NXtomoScan(scan=self.filepath)
+        (
+            self._data, 
+            self.flats, 
+            self.darks, 
+            self.angles_deg,
+        ) = self.import_nexus(self.filepath)
+
+        self.data = self._data
+        self.metadata.set_metadata(self)
+        self.metadata.save_metadata()
+        self.imported = True
+        self.make_import_savedir("tomopyui-" + str(self.filepath.stem))
+        self.import_status_label.value = "Normalizing"
+
+        # Here is the normaliation. You can adjust this depending on what
+        # you do for normalization.
+        self.normalize()
+        self._data[self._data < 0] = 0.0 # non-negative
+        self._data[np.isnan(self._data)] = 0.0 # remove NaNs
+        self._data[np.isinf(self._data)] = 0.0 # remove infs
+        self.data = self._data
+        self.import_status_label.value = "Calculating histogram of raw data and saving."
+
+        # What we want here in self.data is an array of projection images.
+        # These should be [Z, Y, X], where Z is the rotation direction, and X and Y
+        # are projection image dimensions.
+        self.data = da.from_array(self.data, chunks={0: "auto", 1: -1, 2: -1})
+        self.import_status_label.value = "Saving metadata."
+        self.save_data_and_metadata(Uploader)
+        self.data_hierarchy_level = 1
+        self.metadata.set_metadata(self)
+        self.metadata.filedir = self.import_savedir
+        self.metadata.filename = "import_metadata.json"
+        self.metadata.save_metadata()
+        self._close_hdf_file()
+
+    def import_metadata(self, filepath=None):
+        if filepath is None:
+            filepath = self.filepath
+        self.metadata.load_metadata_h5(filepath)
+        self.metadata.set_attributes_from_metadata(self)
+
+    def import_file_projections(self, filepath):
+        pass
+
+    def import_file_flats(self, filepath):
+        pass
+
+    def import_file_darks(self, filepath):
+        pass
+
+    def import_file_angles(self, filepath):
+        pass
+
+    def save_normalized_metadata(self, import_time=None, parent_metadata=None):
+        metadata = Metadata_NXTomo_Prenorm()
+        metadata.filedir = self.filedir
+        metadata.metadata = parent_metadata.copy()
+        if parent_metadata is not None:
+            metadata.metadata["parent_metadata"] = parent_metadata.copy()
+        if import_time is not None:
+            metadata.metadata["import_time"] = import_time
+        metadata.set_metadata(self)
+        metadata.save_metadata()
+        return metadata
+
+    def save_data_and_metadata(self, Uploader):
+        """
+        Saves current data and metadata in import_savedir.
+        """
+        self.filedir = self.import_savedir
+        self._dask_hist_and_save_data()
+        self.saved_as_tiff = False
+        _metadata = self.metadata.metadata.copy()
+        if Uploader.save_tiff_on_import_checkbox.value:
+            Uploader.import_status_label.value = "Saving projections as .tiff."
+            self.saved_as_tiff = True
+            self.save_normalized_as_tiff()
+            self.metadata.metadata["saved_as_tiff"] = True
+        self.metadata.filedir = self.filedir
+        self.toc = time.perf_counter()
+        self.metadata = self.save_normalized_metadata(self.toc - self.tic, _metadata)
+        Uploader.import_status_label.value = "Checking for downsampled data."
+        self._check_downsampled_data(label=Uploader.import_status_label)
+
 
 class Metadata(ABC):
     """
@@ -2065,6 +2194,10 @@ class Metadata(ABC):
             metadata_instance = Metadata_ALS_832_Prenorm()
         if metadata["metadata_type"] == "ALS832_Raw":
             metadata_instance = Metadata_ALS_832_Raw()
+        
+        # DLS Beamlines
+        if metadata["metadata_type"] == "nexus_raw":
+            metadata_instance = Metadata_Nexus_Raw()
 
         # Metadata through rest of processing pipeline
         if metadata["metadata_type"] == "Prep":
@@ -3609,6 +3742,182 @@ class Metadata_APS_Raw(Metadata):
 
         self.dataframe = s
 
+class Metadata_Nexus_Raw(Metadata):
+    def __init__(self):
+        super().__init__()
+        self.filename = "raw_metadata.json"
+        self.metadata["metadata_type"] = "nexus_raw"
+        self.metadata["data_hierarchy_level"] = 0
+        self.table_label.value = "Nexus Raw Metadata"
+
+    def load_metadata_h5(self, h5_filepath):
+        """
+        Loads in metadata from h5 file. You can probably use your dxchange function
+        to read all the metadata in at once. Not sure how it works for you.
+
+        The keys in the self.metadata dictionary can be whatever you want, as long as
+        your set_attributes_from_metadata function above sets the values correctly.
+        """
+        self.filedir = h5_filepath.parent
+        self.filepath = h5_filepath
+        all_metadata = dxchange.read_hdf_meta(h5_filepath)
+
+        self.metadata["pxY"] = int(all_metadata['/entry1/before_scan/det_cfg/cam_img_size_y'])[0]
+        self.metadata["pxX"] = int(all_metadata['/entry1/before_scan/det_cfg/cam_img_size_x'])[0]
+        self.metadata["pxZ"] = int(all_metadata['/entry1/scan_dimensions'])[0]
+
+        # self.metadata["pxsize"] = # scan.pixel_size * 1e6 if scan.pixel_size else 1
+        # self.metadata["px_size_units"] = "um"
+        self.metadata["energy_float"] = float(all_metadata['/entry1/instrument/source/energy'][0]) / 1000
+        self.metadata["kev"] = self.metadata["energy_float"]
+        self.metadata["energy_str"] = str(self.metadata["energy_float"])
+        self.metadata["energy_units"] = "keV"
+        # proj_keys = list(scan.projections.keys())
+        self.metadata["angles_rad"] = dxchange.read_hdf5(h5_filepath, '/entry1/tomo_entry/sample/rotation_angle')        
+        self.metadata["angles_deg"] = (180 / np.pi) * self.metadata["angles_rad"]
+        # self.metadata["angularrange"] = 
+        # self.metadata["propagation_dist"]
+        # self.metadata["exposure_time"]
+
+    def set_metadata(self, projections):
+        """
+        Sets metadata from the DLS h5 filetype
+        """
+        self.metadata["pxX"] = projections.pxX
+        self.metadata["pxY"] = projections.pxY
+        self.metadata["pxZ"] = projections.pxZ
+        # self.metadata["pxsize"] = projections.px_size
+        # self.metadata["px_size_units"] = "um"
+        if projections.energy is not None:
+            self.metadata["kev"] = projections.energy
+            self.metadata["energy_units"] = "keV"
+        # else:
+        #     self.metadata["kev"] = 8000.0
+        #     self.metadata["energy_units"] = "keV"
+        if projections.angles_deg is not None:
+            self.metadata["angles_deg"] = list(projections.angles_deg)
+            self.metadata["angles_rad"] = list(projections.angles_rad)
+
+    def set_attributes_from_metadata(self, projections):
+        projections.pxX = self.metadata["pxX"]
+        projections.pxY = self.metadata["pxY"]
+        projections.pxZ = self.metadata["pxZ"]
+        # projections.px_size = self.metadata["pxsize"]
+        # projections.px_size_units = self.metadata["px_size_units"]
+        projections.energy = self.metadata["kev"]
+        projections.angles_rad = self.metadata["angles_rad"]
+        projections.angles_deg = self.metadata["angles_deg"]
+        # projections.flats_ind = self.metadata["flats_locations"]
+
+    # You can customize the metadata display here.
+    def metadata_to_DataFrame(self):
+
+        # create headers and data for table
+        top_headers = []
+        middle_headers = []
+        data = []
+        # Image information
+        top_headers.append(["Image Information"])
+        middle_headers.append(["X Pixels", "Y Pixels", "Num. θ"])
+        data.append(
+            [
+                self.metadata["pxX"],
+                self.metadata["pxY"],
+                self.metadata["pxZ"],
+            ]
+        )
+
+        top_headers.append(["Experiment Settings"])
+        middle_headers.append(["Energy (keV)"])
+        data.append(
+            [
+                self.metadata["kev"],
+            ]
+        )
+
+        # create dataframe with the above settings
+        df = pd.DataFrame(
+            [data[0]],
+            columns=pd.MultiIndex.from_product([top_headers[0], middle_headers[0]]),
+        )
+        for i in range(len(middle_headers)):
+            if i == 0:
+                continue
+            else:
+                newdf = pd.DataFrame(
+                    [data[i]],
+                    columns=pd.MultiIndex.from_product(
+                        [top_headers[i], middle_headers[i]]
+                    ),
+                )
+                df = df.join(newdf)
+
+        s = df.style.hide(axis="index")
+        s.set_table_styles(
+            {
+                ("Experiment Settings", "Energy (keV)"): [
+                    {"selector": "td", "props": "border-left: 1px solid white"},
+                    {"selector": "th", "props": "border-left: 1px solid white"},
+                ],
+            },
+            overwrite=False,
+        )
+
+        s.set_table_styles(
+            [
+                {"selector": "th.col_heading", "props": "text-align: center;"},
+                {"selector": "th.col_heading.level0", "props": "font-size: 1.2em;"},
+                {"selector": "td", "props": "text-align: center;" "font-size: 1.2em;"},
+                {
+                    "selector": "th:not(.index_name)",
+                    "props": "background-color: #0F52BA; color: white;",
+                },
+            ],
+            overwrite=False,
+        )
+
+        self.dataframe = s
+
+
+# class Metadata_NXTomo_Prenorm(Metadata_NXTomo_Raw):
+#     def __init__(self):
+#         super().__init__()
+#         self.filename = "import_metadata.json"
+#         self.metadata["metadata_type"] = "nxtomo_prenorm"
+#         self.metadata["data_hierarchy_level"] = 1
+#         self.data_hierarchy_level = self.metadata["data_hierarchy_level"]
+#         self.table_label.value = ""
+
+#     def set_metadata(self, projections):
+#         super().set_metadata(projections)
+#         self.filename = "import_metadata.json"
+#         self.metadata["metadata_type"] = "nxtomo_prenorm"
+#         # set to 1
+#         self.metadata["data_hierarchy_level"] = 1
+
+#     # You can again change this. Some of them might not be accurate here, so double check...
+#     def set_attributes_from_metadata(self, projections):
+#         projections.pxY = self.metadata["pxX"]
+#         projections.pxX = self.metadata["pxY"]
+#         projections.pxZ = self.metadata["pxZ"]
+#         projections.px_size = self.metadata["pxsize"]
+#         projections.px_size_units = self.metadata["px_size_units"]
+#         projections.energy = self.metadata["kev"] * 1000
+#         projections.units = "eV"
+#         projections.angles_deg = self.metadata["angles_deg"]
+#         projections.angles_rad = self.metadata["angles_rad"]
+#         projections.angle_start = projections.angles_rad[0]
+#         projections.angle_end = projections.angles_rad[-1]
+
+#     def metadata_to_DataFrame(self):
+#         self.dataframe = None
+
+#     def create_metadata_box(self):
+#         """
+#         Method overloaded because the metadata table is the same as the superclass.
+#         This avoids a space between tables during display.
+#         """
+#         self.metadata_vbox = Output()
 
 class Metadata_APS_Prenorm(Metadata_APS_Raw):
     """
