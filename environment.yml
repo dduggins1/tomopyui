@@ -2,7 +2,6 @@ name: tomopyui
 channels:
   - astra-toolbox
   - conda-forge
-  - defaults
 dependencies:
   - python=3.11
   - matplotlib
